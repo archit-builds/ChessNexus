@@ -12,7 +12,7 @@ import { ReactNode } from 'react';
 
 const RootLayout = ({ children }: { children: ReactNode }) => {
   return (
-    <html>
+    <html suppressHydrationWarning>
       <body>{children}</body>
     </html>
   );

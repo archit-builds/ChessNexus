@@ -1,7 +1,7 @@
 import { DataAPIClient } from '@datastax/astra-db-ts';
 import { PuppeteerWebBaseLoader } from '@langchain/community/document_loaders/web/puppeteer';
 import { RecursiveCharacterTextSplitter } from 'langchain/text_splitter';
-import { GoogleGenerativeAI } from '@google/generative-ai';
+import { GoogleGenAI } from '@google/genai';
 
 import 'dotenv/config';
 
@@ -15,9 +15,33 @@ const {
   GOOGLE_API_KEY,
 } = process.env;
 
-// Initialize Gemini client
-const genAI = new GoogleGenerativeAI(GOOGLE_API_KEY!);
-const embeddingModel = genAI.getGenerativeModel({ model: 'text-embedding-004' });
+const ai = new GoogleGenAI({ apiKey: GOOGLE_API_KEY! });
+
+// Pause execution for the given number of milliseconds
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Embed with automatic retry on 429 (rate limit) using exponential backoff
+async function embedWithRetry(text: string, attempt = 1): Promise<number[]> {
+  try {
+    const response = await ai.models.embedContent({
+      model: 'gemini-embedding-001',
+      contents: text,
+    });
+    return response.embeddings?.[0]?.values ?? [];
+  } catch (err: any) {
+    const status = err?.status ?? err?.response?.status;
+    if (status === 429 && attempt <= 5) {
+      // Parse retryDelay from error details if available, otherwise use exponential backoff
+      const retryAfterMs = (err?.message?.match(/\d+\.\d+s/) 
+        ? parseFloat(err.message.match(/(\d+\.\d+)s/)[1]) * 1000 
+        : Math.pow(2, attempt) * 10000); // 20s, 40s, 80s...
+      console.log(`⏳ Rate limit hit. Waiting ${Math.round(retryAfterMs / 1000)}s before retry (attempt ${attempt}/5)...`);
+      await sleep(retryAfterMs + 2000); // add 2s buffer
+      return embedWithRetry(text, attempt + 1);
+    }
+    throw err;
+  }
+}
 
 const f1Data = [
   'https://en.wikipedia.org/wiki/Chess_opening',
@@ -46,7 +70,7 @@ const createCollection = async (
 ) => {
   const res = await db.createCollection(ASTRA_DB_COLLECTION!, {
     vector: {
-      dimension: 768,
+      dimension: 3072, // gemini-embedding-001 outputs 3072-dimensional vectors
       metric: similarityMetric,
     },
   });
@@ -60,18 +84,17 @@ const loadSampleData = async () => {
     const content = await scrapePage(url);
     const chunks = await splitter.splitText(content);
     for await (const chunk of chunks) {
-      const embeddingResponse = await embeddingModel.embedContent({
-        content: { parts: [{ text: chunk }], role: 'user' },
-      });
+      const vector = await embedWithRetry(chunk);
 
-      const vector = embeddingResponse.embedding.values;
-
-      const res = await collection.insertOne({
+      await collection.insertOne({
         $vector: vector,
         text: chunk,
       });
 
       console.log(`Inserted chunk from ${url}`);
+
+      // Throttle: 200ms between requests (~5 req/s) to stay well under rate limits
+      await sleep(200);
     }
   }
 };
