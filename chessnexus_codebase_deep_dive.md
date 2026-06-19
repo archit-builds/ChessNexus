@@ -94,15 +94,16 @@ graph TB
 | **Why chosen** | Catches bugs at compile time, provides better IDE support, and makes the codebase more maintainable. Explicit types for message shapes ([Message](file:///c:/Users/archi/Desktop/chessgpt/app/page.tsx#11-16) type), API responses, and component props |
 | **Key config** | [tsconfig.json](file:///c:/Users/archi/Desktop/chessgpt/tsconfig.json) targets ES2017, uses `bundler` module resolution (optimized for Next.js), strict mode enabled |
 
-### 3.3 AI/LLM: Google Gemini API (`@google/generative-ai` v0.24.1)
+### 3.3 AI/LLM: Google GenAI SDK (`@google/genai`)
 
 | Aspect | Detail |
 |--------|--------|
-| **What** | Google's generative AI SDK providing both embedding and text generation models |
-| **Why chosen** | Single SDK provides both the **embedding model** (`text-embedding-004`) for vectorizing text AND the **generation model** (`gemini-2.5-flash`) for producing answers. No need for separate embedding + LLM providers |
-| **Models used** | `text-embedding-004` → produces 768-dimensional vectors; `gemini-2.5-flash` → fast, capable text generation |
+| **What** | Google's unified generative AI SDK — the replacement for the deprecated `@google/generative-ai` package |
+| **Why chosen** | Single SDK provides both the **embedding model** (`gemini-embedding-001`) for vectorizing text AND the **generation model** (`gemini-2.5-flash`) for producing answers. The new SDK uses `v1beta` correctly for all supported models |
+| **Models used** | `gemini-embedding-001` → produces 3072-dimensional vectors; `gemini-2.5-flash` → fast, capable text generation |
+| **Migration note** | The old `@google/generative-ai` SDK was deprecated and EOL. The new `@google/genai` SDK uses a flat API: `ai.models.embedContent()` and `ai.models.generateContent()` instead of `genAI.getGenerativeModel(...).method()` |
 
-**Interview talking point:** *"I used Gemini for both embedding and generation. This simplified my stack — one API key, one SDK, guaranteed compatibility between the embedding space used for storage and the one used for retrieval."*
+**Interview talking point:** *"I migrated from the deprecated `@google/generative-ai` SDK to the new unified `@google/genai` SDK. The old SDK defaulted to the `v1beta` API which caused 404 errors for `text-embedding-004`. I switched to `gemini-embedding-001` which is supported on `v1beta` and is the recommended replacement, eliminating any API version issues entirely."*
 
 ### 3.4 Vector Database: DataStax Astra DB (`@datastax/astra-db-ts` v1.5.0)
 
@@ -110,7 +111,7 @@ graph TB
 |--------|--------|
 | **What** | Cloud-native, serverless vector database built on Apache Cassandra |
 | **Why chosen** | Purpose-built for vector similarity search. Serverless = no infrastructure management. Provides a simple insert/query API with built-in vector indexing. Supports `dot_product`, `cosine`, and `euclidean` similarity metrics |
-| **How used** | Stores text chunks alongside their 768-dim vector embeddings. At query time, performs ANN (Approximate Nearest Neighbor) search to find the top 10 most relevant documents |
+| **How used** | Stores text chunks alongside their 3072-dim vector embeddings. At query time, performs ANN (Approximate Nearest Neighbor) search to find the top 10 most relevant documents |
 
 **Interview talking point:** *"I chose Astra DB because it's serverless and specifically designed for vector workloads. I didn't need to manage infrastructure or configure indexing strategies — it handles vector similarity search natively."*
 
@@ -208,14 +209,14 @@ const f1Data = [
 const createCollection = async (similarityMetric: SimilarityMetric = 'dot_product') => {
   const res = await db.createCollection(ASTRA_DB_COLLECTION!, {
     vector: {
-      dimension: 768,      // Must match Gemini text-embedding-004 output dimension
+      dimension: 3072,     // Must match gemini-embedding-001 output dimension
       metric: similarityMetric,  // dot_product for normalized vectors
     },
   });
 };
 ```
 
-**Why 768 dimensions?** The Gemini `text-embedding-004` model produces 768-dimensional vectors. The collection must be configured to match.
+**Why 3072 dimensions?** The `gemini-embedding-001` model produces 3072-dimensional vectors. The collection must be configured to match — a mismatch causes insert/query failures.
 
 **Why dot_product?** For normalized vectors (which Gemini produces), dot product is equivalent to cosine similarity but computationally faster.
 
@@ -272,23 +273,24 @@ This hierarchy preserves semantic coherence by splitting at the most natural bou
 #### Step 4: Embed & Store (Load)
 ```typescript
 for await (const chunk of chunks) {
-  const embeddingResponse = await embeddingModel.embedContent({
-    content: { parts: [{ text: chunk }], role: 'user' },
-  });
-  const vector = embeddingResponse.embedding.values;
+  const vector = await embedWithRetry(chunk);
 
   await collection.insertOne({
-    $vector: vector,   // 768-dimensional float array
+    $vector: vector,   // 3072-dimensional float array
     text: chunk,       // Original text (for retrieval later)
   });
+
+  await sleep(200); // throttle: 200ms between requests
 }
 ```
 
 **Logic:**
-1. Each text chunk is sent to Gemini's `text-embedding-004` model
-2. The model returns a 768-dimensional vector — a numerical representation of the chunk's semantic meaning
+1. Each text chunk is passed to `embedWithRetry()` which calls `gemini-embedding-001` via the `@google/genai` SDK
+2. The model returns a 3072-dimensional vector — a numerical representation of the chunk's semantic meaning
 3. Both the vector AND the original text are stored together in Astra DB
 4. The `$vector` field is automatically indexed by Astra DB for similarity search
+
+**Why `embedWithRetry()`?** The free tier of `gemini-embedding-001` is limited to 1,000 requests/day. If the limit is hit, the function reads the `retryDelay` from the 429 error response and waits automatically before retrying (up to 5 attempts with exponential backoff). A 200ms `sleep()` between inserts further prevents burst rate limiting.
 
 **Why store the original text alongside the vector?** The vector is only for search. When we find relevant documents, we need the actual text to include in the LLM prompt.
 
@@ -348,10 +350,13 @@ The frontend sends the **entire conversation history**. We extract the **latest 
 
 #### Step 2: Embed the Query
 ```typescript
-const model1 = genAI.getGenerativeModel({ model: "text-embedding-004" });
-const embeddingResponse = await model1.embedContent(latestMessage);
+const embeddingResponse = await ai.models.embedContent({
+  model: 'gemini-embedding-001',
+  contents: latestMessage,
+});
+const embeddingValues = embeddingResponse.embeddings?.[0]?.values ?? [];
 ```
-The user's question is converted to a 768-dimensional vector using the **same embedding model** used during data ingestion.
+The user's question is converted to a 3072-dimensional vector using the **same embedding model** used during data ingestion.
 
 **Critical insight for interviews:** The same model MUST be used for both ingestion and querying. If different models were used, the vectors would exist in different embedding spaces and similarity search would be meaningless.
 
@@ -359,7 +364,7 @@ The user's question is converted to a 768-dimensional vector using the **same em
 ```typescript
 const collection = await db.collection(ASTRA_DB_COLLECTION!);
 const cursor = collection.find({}, {
-  sort: { $vector: embeddingResponse.embedding.values },
+  sort: { $vector: embeddingValues },
   limit: 10,
 });
 const documents = await cursor.toArray();
@@ -427,10 +432,11 @@ ${conversationHistory}
 
 #### Step 5: Generate the Answer
 ```typescript
-const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
-const result = await model.generateContent([prompt]);
-const response = await result.response;
-const text = response.text();
+const result = await ai.models.generateContent({
+  model: 'gemini-2.5-flash',
+  contents: prompt,
+});
+const text = result.text ?? '';
 
 return new Response(text, {
   status: 200,
@@ -441,6 +447,8 @@ return new Response(text, {
 **Why `gemini-2.5-flash`?** Flash models are optimized for speed while maintaining quality. For a chatbot, low latency is crucial for good UX.
 
 **Why plain text response (not JSON)?** The response is pure Markdown text. Wrapping it in JSON would add unnecessary parsing complexity on the frontend. The frontend uses `res.text()` to read it directly.
+
+**New SDK syntax:** The `@google/genai` SDK uses `result.text` (a string property) instead of the old `result.response.text()` (a method call).
 
 ---
 
@@ -728,6 +736,9 @@ The CSS provides comprehensive styling for all Markdown elements within chat bub
 > [!WARNING]
 > The `.env` file contains actual API keys and tokens. In production, these should be managed through a secrets manager (e.g., Vercel Environment Variables, AWS Secrets Manager).
 
+> [!IMPORTANT]
+> The Astra DB collection dimension **must match the embedding model output** (3072 for `gemini-embedding-001`). If you switch embedding models, delete the old collection and re-seed — mismatched dimensions cause silent retrieval failures.
+
 ### 10.2 next.config.ts
 ```typescript
 const nextConfig: NextConfig = {
@@ -801,7 +812,7 @@ const nextConfig: NextConfig = {
 3. The knowledge source is transparent and auditable
 
 ### Q: "How does vector similarity search work?"
-**A:** Text is converted to high-dimensional vectors (768 dimensions using Gemini's embedding model) where semantically similar text maps to nearby points. When a user asks a question, their query is also embedded into the same vector space. Astra DB then finds the stored vectors closest to the query vector using Approximate Nearest Neighbor (ANN) search with dot product similarity. The top 10 closest matches are the most relevant documents.
+**A:** Text is converted to high-dimensional vectors (3072 dimensions using `gemini-embedding-001`) where semantically similar text maps to nearby points. When a user asks a question, their query is also embedded into the same vector space. Astra DB then finds the stored vectors closest to the query vector using Approximate Nearest Neighbor (ANN) search with dot product similarity. The top 10 closest matches are the most relevant documents.
 
 ### Q: "Why did you choose Astra DB over Pinecone/Weaviate/ChromaDB?"
 **A:** Astra DB is serverless (zero infrastructure management), has native vector search built on proven Cassandra infrastructure, and provides a clean TypeScript SDK. Pinecone would also work well; Astra DB was chosen for its generous free tier and simplicity of setup. ChromaDB is great for local development but isn't cloud-native.
@@ -835,10 +846,18 @@ This structured approach ensures consistent, well-formatted, contextually ground
 
 ### Q: "What's the difference between the embedding model and the generation model?"
 **A:**
-- **Embedding model** (`text-embedding-004`): Converts text to a fixed-size vector (768 floats). It understands *meaning* but cannot generate text. Used for search/retrieval.
+- **Embedding model** (`gemini-embedding-001`): Converts text to a fixed-size vector (3072 floats). It understands *meaning* but cannot generate text. Used for search/retrieval.
 - **Generation model** (`gemini-2.5-flash`): Takes a text prompt and generates new text. It understands context and produces human-like responses. Used for the actual answer.
 
 Both are from Google Gemini, but they serve fundamentally different purposes in the RAG pipeline.
+
+### Q: "Why did you migrate to `@google/genai` and change the embedding model?"
+**A:** The original `@google/generative-ai` SDK was deprecated and reached end-of-life. Google replaced it with the unified `@google/genai` SDK. During migration, we discovered that `text-embedding-004` is only available on the `v1` API version, but both SDKs default to `v1beta`. Rather than hacking the SDK with `as any` casts or raw `fetch()` calls to a specific API version, I switched to `gemini-embedding-001` — the recommended replacement model — which is fully supported on `v1beta`. This kept the code clean and idiomatic while fixing the 404 errors entirely.
+
+### Q: "How do you handle API rate limits in the seed script?"
+**A:** The free tier for `gemini-embedding-001` allows 1,000 embedding requests per day. The seed script uses two strategies:
+1. **Throttle**: A 200ms `sleep()` between each insert limits throughput to ~5 req/s, preventing burst violations.
+2. **Retry with backoff**: An `embedWithRetry()` wrapper catches 429 errors, reads the `retryDelay` from the error response (e.g. "56s"), waits that duration plus a 2-second buffer, then retries — up to 5 attempts with exponential backoff.
 
 ---
 

@@ -93,6 +93,15 @@ ${conversationHistory}
     });
   } catch (error: any) {
     console.error('Error handling POST:', error);
+
+    // Return a user-friendly message for rate limit errors
+    if (error?.status === 429) {
+      return new Response(
+        '⚠️ **Rate limit reached.** The free tier quota for the embedding model has been exceeded (1,000 requests/day). Please try again later or after midnight Pacific Time when the quota resets.',
+        { status: 429, headers: { 'Content-Type': 'text/plain' } }
+      );
+    }
+
     return new Response('Internal Server Error', { status: 500 });
   }
 }

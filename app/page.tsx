@@ -48,22 +48,27 @@ const Home = () => {
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        // Use the updated messages array that includes the new user message
         body: JSON.stringify({ messages: updatedMessages }),
       })
 
+      // Always show the response body as an assistant bubble —
+      // this includes rate limit messages (429), errors (500), and normal replies
       const reply = await res.text()
       const assistantMessage: Message = {
         id: crypto.randomUUID(),
         role: "assistant",
-        content: reply,
+        content: reply || "Something went wrong. Please try again.",
       }
-
-      // Add assistant message to the current messages (which already includes the user message)
       setMessages((prevMessages) => [...prevMessages, assistantMessage])
     } catch (err) {
+      // Network-level failure (e.g. server offline)
       console.error("Error sending message:", err)
-      // On error, you might want to remove the user message or show an error state
+      const errorMessage: Message = {
+        id: crypto.randomUUID(),
+        role: "assistant",
+        content: "❌ Could not reach the server. Please check your connection and try again.",
+      }
+      setMessages((prevMessages) => [...prevMessages, errorMessage])
     } finally {
       setIsLoading(false)
       setInput("")
